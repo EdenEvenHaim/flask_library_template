@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, logging, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_bcrypt import Bcrypt
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
@@ -11,13 +11,12 @@ from logger import setup_logger
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///library.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SECRET_KEY'] = 'your_secret_key'
-app.config['JWT_SECRET_KEY'] = 'your_jwt_secret_key'
+app.config['JWT_SECRET_KEY'] = "123"
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=1)
 
+jwt = JWTManager(app)
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
-jwt = JWTManager(app)
 CORS(app)  # Enable CORS for all routes
 setup_logger(app)
 
@@ -40,21 +39,21 @@ class Book(db.Model):
     max_loan_days = db.Column(db.Integer, nullable=False)
     loans = db.relationship('Loan', backref='book', lazy=True)
 
-    def __init__(self, name, author, year_published, type):
+    def __init__(self, name, author, year_published, type, max_loan_days):
         self.name = name
         self.author = author
         self.year_published = year_published
-        self.type = type
+        self.type = self.convert_type_to_enum(type)
         self.status = 'available'
-        self.max_loan_days = self.set_max_loan_days()
+        self.max_loan_days = max_loan_days
 
-    def set_max_loan_days(self):
-        if self.type == BookType.LOAN_10_DAYS:
-            return 10
-        elif self.type == BookType.LOAN_5_DAYS:
-            return 5
-        elif self.type == BookType.LOAN_2_DAYS:
-            return 2
+    def convert_type_to_enum(self, type):
+        if type == 1:
+            return BookType.LOAN_10_DAYS
+        elif type == 2:
+            return BookType.LOAN_5_DAYS
+        elif type == 3:
+            return BookType.LOAN_2_DAYS
 
 # 2. Users Model
 class User(db.Model):
@@ -98,7 +97,7 @@ def register():
         hashed_password = bcrypt.generate_password_hash(data['password']).decode('utf-8')
 
         # Set role based on input, default is 'customer'
-        user_role = data.get('role', 'customer')  # Admin role can also be passed in the request
+        user_role = data.get('role', 'admin')  # Admin role can also be passed in the request
 
         # Create new user
         new_user = User(
@@ -122,18 +121,42 @@ def register():
         db.session.rollback()  # Rollback in case of any error
         return jsonify({'message': 'Error registering user', 'error': str(e)}), 500
 
-# Login #
+def get_all():
+    """ Custom function to get all request data. """
+    return request.get_json()  # You can modify this if you need a different format
+
 @app.route('/login', methods=['POST'])
 def login():
-    data = request.get_json()
+    data = get_all()
+
+    # Validate input data
+    if not data or 'username' not in data or 'password' not in data:
+        return jsonify({'message': 'Missing username or password'}), 400
+
+    # Print the received user data
+    print(f'Received username: {data["username"]}')  # Print the username
+
+    # Retrieve user from the database
     user = User.query.filter_by(username=data['username']).first()
-    
-    if user and bcrypt.check_password_hash(user.password, data['password']):
-        access_token = create_access_token(identity=user.id)
-        app.logger.info(f'User {user.username} logged in successfully.')
-        return jsonify({'token': access_token}), 200
+
+    if user:
+        # Print user information if found
+        print(f'User found: {user.username}')  # Print the found user's username
+
+        # Check the hashed password
+        if bcrypt.check_password_hash(user.password, data['password']):
+            # Create access token using the user's ID
+            access_token = create_access_token(identity=user.username)
+
+            # Print the generated access token
+            print(f'Access token generated for user {user.username}: {access_token}')  # Print the token
+
+            return jsonify(token=access_token), 200
+        else:
+            print(f'Invalid password for user {user.username}.')  # Print invalid password attempt
+            return jsonify({'message': 'Invalid credentials'}), 401
     else:
-        app.logger.warning(f'Failed login attempt for username {data["username"]}.')
+        print(f'No user found with username {data["username"]}.')  # Print user not found
         return jsonify({'message': 'Invalid credentials'}), 401
 
 # CRUD #
@@ -165,10 +188,11 @@ def add_customer():
     return jsonify({'message': 'Customer added successfully'}), 201
 
 # Add a new book
-@app.route('/books', methods=['POST'])
+@app.route('/addBook', methods=['POST'])
 @jwt_required()
 def add_book():
-    current_user = User.query.get(get_jwt_identity())
+    print (get_jwt_identity())
+    current_user = User.query.filter_by(username = get_jwt_identity()).one()
     if current_user.role != 'admin':
         return jsonify({'message': 'Admin access required.'}), 403
     
@@ -179,7 +203,7 @@ def add_book():
         author=data['author'],
         year_published=data['year_published'],
         type=data['type'],
-        status='available'
+        max_loan_days=data['max_loan_days']
     )
     
     db.session.add(new_book)
@@ -193,7 +217,7 @@ def add_book():
 @jwt_required()
 def loan_book():
     data = request.get_json()
-    current_user = User.query.get(get_jwt_identity())
+    current_user = User.query.filter_by(username = get_jwt_identity()).one()
     book = Book.query.get(data['book_id'])
 
     if book is None or book.status != 'available':
@@ -235,14 +259,29 @@ def return_book(loan_id):
 @app.route('/books', methods=['GET'])
 @jwt_required()
 def display_books():
-    books = Book.query.all()
-    return jsonify([{'id': book.id, 'name': book.name, 'author': book.author, 'year_published': book.year_published, 'status': book.status} for book in books])
+    current_user = get_jwt_identity()
+    try:
+        books = Book.query.filter(Book.status != 'non-available').all()
+        return jsonify([{
+            'index': index,
+            'id': book.id,
+            'name': book.name,
+            'author': book.author,
+            'year_published': book.year_published,
+            'type': book.type.name,  # Assuming BookType is an Enum
+            'status': book.status,
+            'max_loan_days': book.max_loan_days,
+            'loans': [{'loan_id': loan.id, 'user_id': loan.user_id} for loan in book.loans]
+        } for index, book in enumerate(books)])
+    except Exception as e:
+        logging.error(f"Error fetching books: {str(e)}")
+        return jsonify({"error": "Unable to fetch books"}), 422
 
 # Display all customers (admin only)
 @app.route('/customers', methods=['GET'])
 @jwt_required()
 def display_customers():
-    current_user = User.query.get(get_jwt_identity())
+    current_user = User.query.filter_by(username = get_jwt_identity()).one()
     if current_user.role != 'admin':
         return jsonify({'message': 'Admin access required.'}), 403
     
@@ -253,7 +292,7 @@ def display_customers():
 @app.route('/loans', methods=['GET'])
 @jwt_required()
 def display_loans():
-    current_user = User.query.get(get_jwt_identity())
+    current_user = User.query.filter_by(username = get_jwt_identity()).one()
     
     if current_user.role == 'admin':
         loans = Loan.query.all()
@@ -310,7 +349,7 @@ def find_customer():
 @app.route('/books/<int:book_id>', methods=['DELETE'])
 @jwt_required()
 def remove_book(book_id):
-    current_user = User.query.get(get_jwt_identity())
+    current_user = User.query.filter_by(username = get_jwt_identity()).one()
     if current_user.role != 'admin':
         return jsonify({'message': 'Admin access required.'}), 403
     
@@ -322,11 +361,35 @@ def remove_book(book_id):
         return jsonify({'message': 'Book has been removed.'}), 200
     return jsonify({'message': 'Book not found.'}), 404
 
+#Update book
+@app.route('/books/<int:book_id>', methods=['PUT'])
+@jwt_required()
+def update_book(book_id):
+    current_user = User.query.filter_by(username=get_jwt_identity()).one()
+    if current_user.role != 'admin':
+        return jsonify({'message': 'Admin access required.'}), 403
+
+    book = Book.query.get(book_id)
+    if book:
+        data = request.get_json()
+        
+        # Update the book attributes if provided in the request data
+        book.name = data.get('name', book.name)
+        book.author = data.get('author', book.author)
+        book.year_of_publication = data.get('year_of_publication', book.year_of_publication)
+        book.type = data.get('type', book.type)
+        
+        db.session.commit()
+        app.logger.info(f'Book {book.name} has been updated.')
+        return jsonify({'message': 'Book has been updated successfully.'}), 200
+
+    return jsonify({'message': 'Book not found.'}), 404
+
 # Remove customer (change status to non-available)
 @app.route('/customers/<int:customer_id>', methods=['DELETE'])
 @jwt_required()
 def remove_customer(customer_id):
-    current_user = User.query.get(get_jwt_identity())
+    current_user = User.query.filter_by(username = get_jwt_identity()).one()
     if current_user.role != 'admin':
         return jsonify({'message': 'Admin access required.'}), 403
     
